@@ -1,0 +1,21 @@
+{
+  "name": "Crash Derby",
+  "genre": "racing",
+  "dim": "3D",
+  "mode": "Versus",
+  "players": "2–8",
+  "hook": "Ram, dent and wreck them. Last car running wins.",
+  "how": "Everyone drives into one dirt bowl. Ram the other cars, side hits do the most damage, and boost in for a big one. Dents, smoke and loose parts show who is hurting; the last car still running wins.",
+  "controls": "Arrow keys or WASD to drive, Shift or Space to boost, or on-screen buttons",
+  "uses": [
+    ["Leaderboard", "The best derby scores: damage dealt, wrecks and wins."],
+    ["Host-run rounds", "The host's browser starts and ends each round; if it leaves, the next player takes over."],
+    ["Bots", "Bots ram and dodge until enough people join."],
+    ["Live sync", "Every car drives for everyone at once, and the car that gets hit works out its own damage."]
+  ],
+  "ideas": [
+    "Add a ramp in the middle of the bowl",
+    "Add a repair pickup that heals 30 health",
+    "Make it a snowy ice rink where cars slide more"
+  ]
+}
