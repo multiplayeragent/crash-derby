@@ -93,7 +93,8 @@
  *     and tells the other car with the event "ram" {to, sp, x, z}: sp is how fast it came
  *     in. The car that got hit (the VICTIM) decides its own damage from sp and where it was
  *     hit (side hits hurt most), then answers "dmg" {to, n, ko, v} so the rammer scores.
- *     The host does all of this for the bots (bot hits bot, bot hits you).
+ *     The host does all of this for the bots (bot hits bot, bot hits you), and sends "fx"
+ *     {x, z, sp} for the crashes only it works out, so everyone sees the sparks.
  *   - Health lives in each car's own state, so dents, smoke and loose parts show the same
  *     for everyone (a view dents where state says the last hit landed).
  *   - Intent: "again" {} from the results card asks the host to start the next round now.
@@ -132,6 +133,7 @@ const CONFIG = {
   countdown: 4000,        // ms on the grid before GO
   roundTime: 90000,       // ms before the round ends anyway (most health wins)
   afterHumans: 15000,     // once every human is wrecked, the bots finish within this
+  endPause: 800,          // ms between the last wreck and the results (the last hit's points arrive in this time)
   resultsFor: 10000,      // ms the results show before the next round
   botSkill: [0.75, 0.95], // bots' aim and reactions
   board: "derby-score",
@@ -557,7 +559,7 @@ function credit(to, n, ko, victim) {
 const nameOf = (id) => id === net.sessionId ? "You" : S.entities.players?.[id]?.n || botList().find((b) => b.i === id)?.n || "A car";
 
 // ── ROUND (HOST) ────────────────────────────────────────────────────────────────────
-const host = { bots: new Map(), wasHost: false, lastBots: 0, roundId: 0, last: null, cd: new Map() };
+const host = { bots: new Map(), wasHost: false, lastBots: 0, roundId: 0, last: null, cd: new Map(), endAt: 0, lastFx: 0 };
 /** The round as state has it, or the host's own newer write that hasn't come back yet. `v` only goes up. */
 function round() {
   const r = shared("round", null);
@@ -621,11 +623,14 @@ function hostTick(dt, now) {
   if (r.phase === "fight") {
     const st = standings(r), alive = st.filter((x) => !x.o), humansAlive = humans.filter((h) => !h.k.o).length;
     if (!ATTRACT && humans.length && !humansAlive && r.endsAt > t + CONFIG.afterHumans) r = writeRound({ ...r, endsAt: t + CONFIG.afterHumans });
-    if (alive.length <= 1 || t > r.endsAt) {
+    if (alive.length > 1 && t <= r.endsAt) host.endAt = 0;
+    else if (!host.endAt) host.endAt = t + CONFIG.endPause; // it's over: wait a moment, so the last hit's points reach every player's score
+    else if (t >= host.endAt) {
+      host.endAt = 0;
       const top = alive.length === 1 ? alive[0] : alive.length > 1 && alive[0].hp > alive[1].hp ? alive[0] : null; // a tie on health is a draw
       r = writeRound({ ...r, phase: "done", endsAt: t + CONFIG.resultsFor, w: top ? top.id : "", results: st.map((x) => ({ id: x.id, n: x.n, sc: x.sc + (top && x.id === top.id ? 100 : 0), o: x.o ? 1 : 0 })) });
     }
-  }
+  } else host.endAt = 0;
   if (r.phase === "done" && t > r.endsAt) r = newRound(r.id + 1);
   // the bots drive, then crash into each other and into the players
   const fighting = r.phase === "fight";
@@ -639,24 +644,36 @@ function hostTick(dt, now) {
       const bv = [b.vx, b.vz], ov = [o.vx, o.vz];
       const sb = bump(b, o, ov[0], ov[1], hit), so = bump(o, b, bv[0], bv[1], { ...hit, nx: -hit.nx, nz: -hit.nz });
       if (fighting && pairReady(b.id + o.id, now)) {
-        if (sb > CONFIG.minRam) { const n = takeHit(o, b.x, b.z, sb, b.id, r); selfHit(b, sb, r); credit(b.id, n, o.out && n > 0, o.id); ramFx(hit.px, hit.pz, sb); }
-        if (so > CONFIG.minRam) { const n = takeHit(b, o.x, o.z, so, o.id, r); selfHit(o, so, r); credit(o.id, n, b.out && n > 0, b.id); ramFx(hit.px, hit.pz, so); }
+        if (sb > CONFIG.minRam && !o.out) botRam(b, o, sb, hit, r, now);
+        if (so > CONFIG.minRam && !b.out) botRam(o, b, so, hit, r, now);
       }
     }
     for (const [id, v] of views) { // bot meets a player: the bot bounces, the player is told
       if (host.bots.has(id) || !v.live) continue;
       const hit = contact(b, v); if (!hit) continue;
       const sb = bump(b, v, v.vx, v.vz, hit);
-      if (fighting && sb > CONFIG.minRam && pairReady(b.id + id, now)) { net.send("ram", { to: id, sp: +sb.toFixed(1), x: +b.x.toFixed(1), z: +b.z.toFixed(1), px: +hit.px.toFixed(1), pz: +hit.pz.toFixed(1), f: b.id }); selfHit(b, sb, r); ramFx(hit.px, hit.pz, sb); }
+      if (fighting && !v.out && sb > CONFIG.minRam && pairReady(b.id + id, now)) { net.send("ram", { to: id, sp: +sb.toFixed(1), x: +b.x.toFixed(1), z: +b.z.toFixed(1), px: +hit.px.toFixed(1), pz: +hit.pz.toFixed(1), f: b.id }); selfHit(b, sb, r); ramFx(hit.px, hit.pz, sb); }
     }
     if (me.spec) continue;
     const hit = contact(b, me.c); // the host's own car
-    if (hit) { const sb = bump(b, me.c, me.c.vx, me.c.vz, hit); if (fighting && sb > CONFIG.minRam && pairReady(b.id + net.sessionId, now)) { onRam({ to: net.sessionId, sp: sb, x: b.x, z: b.z, px: hit.px, pz: hit.pz }, b.id); selfHit(b, sb, r); } }
+    if (hit) { const sb = bump(b, me.c, me.c.vx, me.c.vz, hit); if (fighting && !me.c.out && sb > CONFIG.minRam && pairReady(b.id + net.sessionId, now)) { onRam({ to: net.sessionId, sp: sb, x: b.x, z: b.z, px: hit.px, pz: hit.pz }, b.id); selfHit(b, sb, r); shareFx(hit.px, hit.pz, sb, now); } }
   }
   if (now - host.lastBots > 100) {
     host.lastBots = now;
     net.setShared("bots", JSON.stringify(botList().map((b) => ({ ...b, x: +b.x.toFixed(2), z: +b.z.toFixed(2), h: +b.h.toFixed(2), vx: +b.vx.toFixed(1), vz: +b.vz.toFixed(1), bm: +b.bm.toFixed(2), s: +b.s.toFixed(1), sk: +b.sk.toFixed(2) }))));
   }
+}
+/** Bot b rams bot o at speed sp: the host works out both sides, and tells the others so they see it too. */
+function botRam(b, o, sp, hit, r, now) {
+  const n = takeHit(o, b.x, b.z, sp, b.id, r); selfHit(b, sp, r);
+  credit(b.id, n, o.out && n > 0, o.id);
+  if (o.out && n > 0) net.send("dmg", { to: b.id, n, ko: 1, v: o.id }); // the wreck shows in everyone's feed
+  ramFx(hit.px, hit.pz, sp); shareFx(hit.px, hit.pz, sp, now);
+}
+/** A crash only the host works out (bot hits bot, a bot and the host's own car): tell the others to draw the sparks. At most 12 a second. */
+function shareFx(x, z, sp, now) {
+  if (now - host.lastFx < 80) return;
+  host.lastFx = now; net.send("fx", { x: +x.toFixed(1), z: +z.toFixed(1), sp: +sp.toFixed(1) });
 }
 /** Each pair of cars counts one ram at most every 0.5s. */
 function pairReady(key, now) { if ((host.cd.get(key) || 0) > now) return false; host.cd.set(key, now + 500); return true; }
@@ -720,13 +737,16 @@ const me = { c: { x: 0, z: 0, h: 0, vx: 0, vz: 0, hp: 100, bm: 1, out: false, wt
 const input = { left: false, right: false, gas: false, rev: false, boost: false };
 const myPacked = () => ({ r: me.roundId, x: +me.c.x.toFixed(2), z: +me.c.z.toFixed(2), h: +me.c.h.toFixed(2), vx: +me.c.vx.toFixed(1), vz: +me.c.vz.toFixed(1), hp: me.c.hp, b: me.c.boosting ? 1 : 0, hd: me.c.hd || 0, sc: me.sc, o: me.c.out ? 1 : 0, wt: me.c.wt || 0, s: +(me.c.steer || 0).toFixed(1), sp: me.spec ? 1 : 0 });
 
+/** My spot on the grid: my place in the list of live players, so no two players share one. */
+function mySlot() {
+  const live = livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
+  return ATTRACT ? gridSlot(CONFIG.seats, slotTotal(0)) : gridSlot(Math.max(0, live.indexOf(net.sessionId)), slotTotal(live.length));
+}
 function resetForRound(r) {
   me.roundId = r.id; me.sc = 0;
   const lateJoin = r.phase === "done" || (r.phase === "fight" && Date.now() - r.startAt > CONFIG.joinWindow);
   me.spec = !ATTRACT && lateJoin;
-  const live = livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
-  const s = ATTRACT ? gridSlot(CONFIG.seats, slotTotal(0)) : gridSlot(Math.max(0, live.indexOf(net.sessionId)), slotTotal(live.length));
-  Object.assign(me.c, { x: s.x, z: s.z, h: s.h, vx: 0, vz: 0, hp: 100, bm: 1, out: false, wt: 0, hd: 0, boosting: false });
+  Object.assign(me.c, mySlot(), { vx: 0, vz: 0, hp: 100, bm: 1, out: false, wt: 0, hd: 0, boosting: false });
   if (me.v) { scene.remove(me.v.g); me.v = null; }
   for (const d of debris) scene.remove(d.m); debris.length = 0;
   for (const [id, v] of views) { scene.remove(v.g); views.delete(id); }
@@ -744,6 +764,7 @@ function myTick(dt, r, now) {
     ctl = fighting ? { steer, gas: input.gas ? 1 : 0, rev: input.rev ? 1 : 0, boost: input.boost } : { steer: 0, gas: 0, rev: 0, boost: false };
   }
   if (!me.spec) {
+    if (r.phase === "grid") Object.assign(me.c, mySlot(), { vx: 0, vz: 0 }); // someone joined or left before GO: the grid closes up
     stepCar(me.c, ctl, dt);
     if (me.c.wall > 6) { me.shake = Math.min(1, me.c.wall / 20); crashFx(me.c.x, me.c.z, 4); crunch(me.c.wall * 0.5, 1); }
     // my car meets anyone I draw: I bounce, and tell them how hard I hit
@@ -754,7 +775,7 @@ function myTick(dt, r, now) {
       if (fighting && !v.out && sp > CONFIG.minRam && (me.cd.get(id) || 0) < now) {
         me.cd.set(id, now + 500);
         const msg = { to: id, sp: +sp.toFixed(1), x: +me.c.x.toFixed(1), z: +me.c.z.toFixed(1), px: +hit.px.toFixed(1), pz: +hit.pz.toFixed(1) };
-        if (isHost() && host.bots.has(id)) onRam(msg, net.sessionId); else net.send("ram", msg);
+        if (isHost() && host.bots.has(id)) { onRam(msg, net.sessionId); shareFx(hit.px, hit.pz, sp, now); } else net.send("ram", msg);
         selfHit(me.c, sp, r); ramFx(hit.px, hit.pz, sp); me.shake = Math.min(1, sp / 25);
       }
     }
@@ -843,13 +864,14 @@ document.body.classList.toggle("touch", touchUI);
 const KEYS = { ArrowLeft: "left", a: "left", A: "left", ArrowRight: "right", d: "right", D: "right", ArrowUp: "gas", w: "gas", W: "gas", ArrowDown: "rev", s: "rev", S: "rev", Shift: "boost", " ": "boost" };
 addEventListener("keydown", (e) => { wakeAudio(); const k = KEYS[e.key]; if (k) { e.preventDefault(); input[k] = true; } });
 addEventListener("keyup", (e) => { const k = KEYS[e.key]; if (k) input[k] = false; });
+addEventListener("blur", () => { for (const k in input) input[k] = false; for (const b of document.querySelectorAll(".pad button")) b.classList.remove("on"); }); // no key stays down when the tab loses focus
 for (const b of document.querySelectorAll(".pad button")) {
   const k = b.dataset.k, on = (v) => { input[k] = v; b.classList.toggle("on", v); };
   b.addEventListener("pointerdown", (e) => { e.preventDefault(); wakeAudio(); b.setPointerCapture(e.pointerId); on(true); });
   for (const ev of ["pointerup", "pointercancel"]) b.addEventListener(ev, () => on(false));
 }
 renderer.domElement.addEventListener("pointerdown", wakeAudio);
-document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+document.addEventListener("touchmove", (e) => { if (!e.target.closest || !e.target.closest(".card")) e.preventDefault(); }, { passive: false }); // the page never scrolls; a long results card does
 
 // ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
 const views = new Map(); // id -> drawn car for everyone but me: { g, x, z, h, vx, vz, live, out, ... }
@@ -949,6 +971,7 @@ function frame(now) {
   net.onState((st) => { S = st; });
   net.on("ram", (msg, from) => onRam(msg, (msg && msg.f) || from)); // f: the bot that rammed (the host sends for its bots)
   net.on("dmg", (msg) => { if (!msg) return; if (msg.to === net.sessionId || (isHost() && host.bots.has(msg.to))) credit(msg.to, msg.n, !!msg.ko, msg.v); else if (msg.ko) feed(msg.to, msg.v); });
+  net.on("fx", (msg) => { if (msg) ramFx(msg.x, msg.z, msg.sp); }); // a crash the host worked out
   net.on("again", () => again());
   net.onDisconnect(() => { dropped = true; $("net").textContent = "Reconnecting…"; });
   net.onReconnect(() => { dropped = false; });
